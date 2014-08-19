@@ -1,0 +1,105 @@
+---
+- hosts: all
+  sudo: yes
+  handlers:
+    - include: handlers/main.yml
+  tasks:
+  - name: Set python2 to be default
+    file: name=/usr/bin/python src=/usr/bin/python2 state=link
+
+  - name: Install setuptools
+    shell: wget https://bootstrap.pypa.io/ez_setup.py -O - | python
+
+  - name: Install pip
+    easy_install: name=pip
+
+  - name: Install required packages using pacman
+    pacman: name={{ item }} state=present
+    with_items:
+      - gcc
+      - make
+      - htop
+      - git
+      - sudo
+
+  - name: Install required packages using pip
+    pip: name={{ item }} state=present
+    with_items:
+      - virtualenv
+      - supervisor
+
+  - name: Create groups
+    group: name={{ item }} state=present
+    with_items:
+      - security
+      - spi
+      - gpio
+
+  - name: Copy udev SPI group rule
+    copy: src=files/50-spi.rules dest=/etc/udev/rules.d/50-spi.rules
+    notify:
+      - Reboot
+      - Wait for shutdown
+      - Wait for boot
+
+  - name: Copy udev GPIO group rule
+    copy: src=files/51-gpio.rules dest=/etc/udev/rules.d/51-gpio.rules
+    notify:
+      - Reboot
+      - Wait for shutdown
+      - Wait for boot
+
+  - name: Create 'security' user
+    user: name=security shell=/bin/bash createhome=yes home=/home/security groups=security,spi,gpio
+
+  - name: Create virtualenv
+    command: creates=/home/security/ve virtualenv /home/security/ve
+    sudo_user: security
+
+  - name: Get latest pifacecommon package
+    git: repo=https://github.com/piface/pifacecommon.git dest=/home/security/pifacecommon
+    sudo_user: security
+    register: pifacecommon
+
+  - name: Install pifacecommon into virtualenv
+    command: chdir=/home/security/pifacecommon /home/security/ve/bin/python setup.py install
+    sudo_user: security
+    when: pifacecommon.changed
+
+  - name: Get latest gpio-admin package
+    git: repo=https://github.com/quick2wire/quick2wire-gpio-admin.git dest=/home/security/quick2wire-gpio-admin
+    sudo_user: security
+    register: gpioadmin
+
+  - name: Build gpio-admin
+    command: chdir=/home/security/quick2wire-gpio-admin make
+    sudo_user: security
+    when: gpioadmin.changed
+
+  - name: Install gpio-admin
+    command: chdir=/home/security/quick2wire-gpio-admin make install
+    when: gpioadmin.changed
+
+  - name: Add security user to gpio group
+    user: name=security append=yes groups=gpio
+
+  - name: Get latest pifacedigitalio package
+    git: repo=https://github.com/piface/pifacedigitalio.git dest=/home/security/pifacedigitalio
+    sudo_user: security
+    register: pifacedigitalio
+
+  - name: Install pifacedigitalio into virtualenv
+    command: chdir=/home/security/pifacedigitalio /home/security/ve/bin/python setup.py install
+    sudo_user: security
+    when: pifacedigitalio.changed
+
+  - name: Install pyzmq into virtualenv
+    pip: name=pyzmq virtualenv=/home/security/ve state=present
+    sudo_user: security
+
+  - name: Copy /boot/config.txt
+    copy: src=files/config.txt dest=/boot/config.txt
+    notify:
+      - Reboot
+      - Wait for shutdown
+      - Wait for boot
