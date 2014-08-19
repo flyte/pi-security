@@ -103,3 +103,6 @@
       - Reboot
       - Wait for shutdown
       - Wait for boot
+
+  - name: Get latest pi-security package
+    git: repo=https://github.com/flyte/pi-security.git dest=/home/security/pi-security
