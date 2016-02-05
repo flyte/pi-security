@@ -61,7 +61,7 @@ def publish_state(chan, state):
 
 
 def on_msg(client, userdata, msg):
-    chan = msg.topic.lstrip(CHANNEL_PREFIX).rstrip(SET_SUFFIX)
+    chan = msg.topic[len(CHANNEL_PREFIX):-len(SET_SUFFIX)]
     try:
         output = SWITCHES_CHAN_TO_OUTPUT[chan]
     except KeyError:
