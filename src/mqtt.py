@@ -1,5 +1,6 @@
 import argparse
 from time import sleep
+from threading import Timer
 
 import paho.mqtt.client as mqtt
 import pifacedigitalio as pfdio
@@ -25,6 +26,9 @@ INPUT_PINS = {chan: pin for chan, pin, _ in INPUTS}
 INPUT_INVERT = {chan: invert for chan, _, invert in INPUTS}
 PAYLOAD_ON = "ON"
 PAYLOAD_OFF = "OFF"
+MOVEMENT_TO_WARNING_SECS = 4
+WARNING_TO_SOUNDING_SECS = 10
+SOUNDING_SECS = 20
 
 
 def on_connect(client, userdata, flags, rc):
@@ -82,20 +86,22 @@ def on_msg(client, userdata, msg):
 
 
 class Security(Machine):
-    states = "disarmed armed caution sounding".split()
+    states = "disarmed armed warning sounding".split()
     transitions = [
         "disarm * disarmed".split(),
         "arm disarmed armed".split(),
-        "warn armed caution".split(),
-        ["sound", ["armed", "caution"], "sounding"],
-        ["relax", ["caution", "sounding"], "armed"]
+        "warn armed warning".split(),
+        ["sound", ["armed", "warning"], "sounding"],
+        ["relax", ["warning", "sounding"], "armed"]
     ]
     initial = "disarmed"
-    caution_timeout = None
-    sounding_timeout = None
+    _warning_timer = None
+    _sounding_timer = None
+    _sounding_stop_timer = None
 
     def __init__(self, stop_event, piface, mqtt_client):
         self._stop_event = stop_event
+        self._pf = piface
         self._mqtt = mqtt_client
         Machine.__init__(
             self,
@@ -103,7 +109,7 @@ class Security(Machine):
             initial=self.initial
         )
         for t in self.transitions:
-            self.add_transition(*t, after="update_mqtt")
+            self.add_transition(*t, after="update_mqtt_state")
 
         # Register our interest in detected movement
         input_listener = pfdio.InputEventListener(chip=piface)
@@ -114,18 +120,81 @@ class Security(Machine):
 
     def movement(self):
         """ Called when there is movement detected. """
-        if self.state == "disarmed":
+        if self.is_disarmed():
             print "Movement detected but we're in the 'disarmed' state."
             return
-        if self.state == "armed":
-            print "Movement detected and we're armed!"
+        if self.is_armed():
+            print "Movement detected and we're armed! Starting warning timer.."
+            # Start the warning timer
+            self._warning_timer = Timer(MOVEMENT_TO_WARNING_SECS, self.warn)
+            self._warning_timer.start()
 
-    def update_mqtt(self):
+    def no_movement(self):
+        """ Called when the movement stops. """
+        try:
+            self._warning_timer.cancel()
+            self._warning_timer = None
+            print "Stopped warning timer."
+        except AttributeError:
+            # _warning_timer must have been None
+            print "No warning timer to stop."
+            pass
+
+    def update_mqtt_state(self):
         """ Update mqtt with the current state. """
+        print "Changed to state %s" % self.state
         self._mqtt.publish(
             "{}{}".format(CHANNEL_PREFIX, SECURITY_CHAN),
             payload=self.state,
             retain=True)
+
+    def on_enter_warning(self):
+        """ Sound the buzzer and start the sounding timer. """
+        # self._pf.output_pins[SWITCH_PINS["buzzer"]].turn_on()
+        self._mqtt.publish(
+            "{}{}".format(CHANNEL_PREFIX, "buzzer"),
+            payload=PAYLOAD_ON,
+            retain=True)
+        self._sounding_timer = Timer(WARNING_TO_SOUNDING_SECS, self.sound)
+        self._sounding_timer.start()
+
+    def on_exit_warning(self):
+        """ Stop sounding the buzzer. """
+        # self._pf.output_pins[SWITCH_PINS["buzzer"]].turn_off()
+        self._mqtt.publish(
+            "{}{}".format(CHANNEL_PREFIX, "buzzer"),
+            payload=PAYLOAD_OFF,
+            retain=True)
+        try:
+            self._sounding_timer.cancel()
+            self._sounding_timer = None
+        except AttributeError:
+            # _sounding_timer must have been None
+            pass
+
+    def on_enter_sounding(self):
+        """ Sound the siren. """
+        # self._pf.output_pins[SWITCH_PINS["siren"]].turn_on()
+        self._mqtt.publish(
+            "{}{}".format(CHANNEL_PREFIX, "siren"),
+            payload=PAYLOAD_ON,
+            retain=True)
+        self._sounding_stop_timer = Timer(SOUNDING_SECS, self.relax)
+        self._sounding_stop_timer.start()
+
+    def on_exit_sounding(self):
+        """ Stop sounding the siren. """
+        # self._pf.output_pins[SWITCH_PINS["siren"]].turn_off()
+        self._mqtt.publish(
+            "{}{}".format(CHANNEL_PREFIX, "siren"),
+            payload=PAYLOAD_OFF,
+            retain=True)
+        try:
+            self._sounding_off_timer.cancel()
+            self._sounding_off_timer = None
+        except AttributeError:
+            # _sounding_off_timer must have been None
+            pass
 
 
 if __name__ == "__main__":
