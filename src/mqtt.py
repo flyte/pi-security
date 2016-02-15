@@ -2,22 +2,27 @@ import argparse
 from time import sleep
 
 import paho.mqtt.client as mqtt
-import pifacedigitalio
+import pifacedigitalio as pfdio
+from transitions import Machine
 
 
 CHANNEL_PREFIX = "home/garage/"
 SET_SUFFIX = "/set"
+SECURITY_CHAN = "security"
 SWITCHES = (
     ("socket1", 0, False),
     ("socket2", 1, False),
     ("siren", 2, False),
     ("buzzer", 3, False)
 )
-SWITCHES_CHAN_TO_OUTPUT = {chan: output for chan, output, _ in SWITCHES}
+SWITCH_PINS = {chan: output for chan, output, _ in SWITCHES}
+SWITCH_INVERT = {chan: invert for chan, _, invert in SWITCHES}
 INPUTS = (
     ("tamper", 0, True),
     ("motion", 1, True)
 )
+INPUT_PINS = {chan: pin for chan, pin, _ in INPUTS}
+INPUT_INVERT = {chan: invert for chan, _, invert in INPUTS}
 PAYLOAD_ON = "ON"
 PAYLOAD_OFF = "OFF"
 
@@ -56,14 +61,15 @@ def publish_output_state(chan, output, invert):
 
 def publish_state(chan, state):
     payload = PAYLOAD_ON if state else PAYLOAD_OFF
-    client.publish("{}{}".format(CHANNEL_PREFIX, chan), payload=payload, retain=True)
+    client.publish(
+        "{}{}".format(CHANNEL_PREFIX, chan), payload=payload, retain=True)
     print "{} state set to {}".format(chan, payload)
 
 
 def on_msg(client, userdata, msg):
     chan = msg.topic[len(CHANNEL_PREFIX):-len(SET_SUFFIX)]
     try:
-        output = SWITCHES_CHAN_TO_OUTPUT[chan]
+        output = SWITCH_PINS[chan]
     except KeyError:
         print "{} isn't a channel we care about.".format(chan)
     if msg.payload == PAYLOAD_ON:
@@ -75,6 +81,53 @@ def on_msg(client, userdata, msg):
     print "{} {}".format(msg.topic, msg.payload)
 
 
+class Security(Machine):
+    states = "disarmed armed caution sounding".split()
+    transitions = [
+        "disarm * disarmed".split(),
+        "arm disarmed armed".split(),
+        "warn armed caution".split(),
+        ["sound", ["armed", "caution"], "sounding"],
+        ["relax", ["caution", "sounding"], "armed"]
+    ]
+    initial = "disarmed"
+    caution_timeout = None
+    sounding_timeout = None
+
+    def __init__(self, stop_event, piface, mqtt_client):
+        self._stop_event = stop_event
+        self._mqtt = mqtt_client
+        Machine.__init__(
+            self,
+            states=self.states,
+            initial=self.initial
+        )
+        for t in self.transitions:
+            self.add_transition(*t, after="update_mqtt")
+
+        # Register our interest in detected movement
+        input_listener = pfdio.InputEventListener(chip=piface)
+        edge = (pfdio.IODIR_FALLING_EDGE if INPUT_INVERT["motion"]
+                else pfdio.IODIR_RISING_EDGE)
+        input_listener.register(
+            INPUT_PINS["motion"], edge, self.movement)
+
+    def movement(self):
+        """ Called when there is movement detected. """
+        if self.state == "disarmed":
+            print "Movement detected but we're in the 'disarmed' state."
+            return
+        if self.state == "armed":
+            print "Movement detected and we're armed!"
+
+    def update_mqtt(self):
+        """ Update mqtt with the current state. """
+        self._mqtt.publish(
+            "{}{}".format(CHANNEL_PREFIX, SECURITY_CHAN),
+            payload=self.state,
+            retain=True)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("user")
@@ -83,7 +136,7 @@ if __name__ == "__main__":
     p.add_argument("--port", type=int, default=1883)
     args = p.parse_args()
 
-    pf = pifacedigitalio.PiFaceDigital()
+    pf = pfdio.PiFaceDigital()
 
     client = mqtt.Client()
     client.on_connect = on_connect
