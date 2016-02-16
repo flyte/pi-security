@@ -1,6 +1,7 @@
 import argparse
 from time import sleep
 from threading import Timer
+from functools import partial
 
 import paho.mqtt.client as mqtt
 import pifacedigitalio as pfdio
@@ -9,7 +10,7 @@ from transitions import Machine
 
 CHANNEL_PREFIX = "home/garage/"
 SET_SUFFIX = "/set"
-SECURITY_CHAN = "security"
+SECURITY_CHAN = "alarm"
 SWITCHES = (
     ("socket1", 0, False),
     ("socket2", 1, False),
@@ -26,16 +27,21 @@ INPUT_PINS = {chan: pin for chan, pin, _ in INPUTS}
 INPUT_INVERT = {chan: invert for chan, _, invert in INPUTS}
 PAYLOAD_ON = "ON"
 PAYLOAD_OFF = "OFF"
-MOVEMENT_TO_WARNING_SECS = 4
-WARNING_TO_SOUNDING_SECS = 10
-SOUNDING_SECS = 20
+MOVEMENT_TO_WARNING_SECS = 5
+WARNING_TO_SOUNDING_SECS = 20
+SOUNDING_SECS = 120
 
 
 def on_connect(client, userdata, flags, rc):
     print("Connected with result code "+str(rc))
     for chan, _, _ in SWITCHES:
         client.subscribe("{}{}{}".format(CHANNEL_PREFIX, chan, SET_SUFFIX))
+    client.subscribe(
+        "{}{}{}".format(CHANNEL_PREFIX, SECURITY_CHAN, SET_SUFFIX))
     set_all_states()
+
+    client.subscribe("{}{}{}".format(CHANNEL_PREFIX, "movement", SET_SUFFIX))
+    client.subscribe("{}{}{}".format(CHANNEL_PREFIX, "no_movement", SET_SUFFIX))
 
 
 def set_all_states():
@@ -72,17 +78,38 @@ def publish_state(chan, state):
 
 def on_msg(client, userdata, msg):
     chan = msg.topic[len(CHANNEL_PREFIX):-len(SET_SUFFIX)]
-    try:
-        output = SWITCH_PINS[chan]
-    except KeyError:
-        print "{} isn't a channel we care about.".format(chan)
-    if msg.payload == PAYLOAD_ON:
-        pf.output_pins[output].turn_on()
-        publish_state(chan, True)
-    elif msg.payload == PAYLOAD_OFF:
-        pf.output_pins[output].turn_off()
-        publish_state(chan, False)
+
+    if chan == "movement":
+        security.movement()
+    elif chan == "no_movement":
+        security.no_movement()
+
+    if chan == SECURITY_CHAN:
+        if msg.payload == "armed":
+            print "Arming security..."
+            security.arm()
+        elif msg.payload == "disarmed":
+            print "Disarming security..."
+            security.disarm()
+    else:
+        try:
+            output = SWITCH_PINS[chan]
+        except KeyError:
+            print "{} isn't a channel we care about.".format(chan)
+        if msg.payload == PAYLOAD_ON:
+            pf.output_pins[output].turn_on()
+            publish_state(chan, True)
+        elif msg.payload == PAYLOAD_OFF:
+            pf.output_pins[output].turn_off()
+            publish_state(chan, False)
     print "{} {}".format(msg.topic, msg.payload)
+
+
+def change_output(pin, state):
+    if state:
+        pf.output_pins[pin].turn_on()
+    else:
+        pf.output_pins[pin].turn_off()
 
 
 class Security(Machine):
@@ -95,14 +122,17 @@ class Security(Machine):
         ["relax", ["warning", "sounding"], "armed"]
     ]
     initial = "disarmed"
-    _warning_timer = None
-    _sounding_timer = None
-    _sounding_stop_timer = None
+    _warning_timer = Timer(None, None)
+    _sounding_timer = Timer(None, None)
+    _sounding_stop_timer = Timer(None, None)
 
-    def __init__(self, stop_event, piface, mqtt_client):
-        self._stop_event = stop_event
-        self._pf = piface
+    def __init__(self, mqtt_client, buzzer_start,
+                 buzzer_stop, siren_start, siren_stop):
         self._mqtt = mqtt_client
+        self._buzzer_start = buzzer_start
+        self._buzzer_stop = buzzer_stop
+        self._siren_start = siren_start
+        self._siren_stop = siren_stop
         Machine.__init__(
             self,
             states=self.states,
@@ -110,13 +140,7 @@ class Security(Machine):
         )
         for t in self.transitions:
             self.add_transition(*t, after="update_mqtt_state")
-
-        # Register our interest in detected movement
-        input_listener = pfdio.InputEventListener(chip=piface)
-        edge = (pfdio.IODIR_FALLING_EDGE if INPUT_INVERT["motion"]
-                else pfdio.IODIR_RISING_EDGE)
-        input_listener.register(
-            INPUT_PINS["motion"], edge, self.movement)
+        self.update_mqtt_state()
 
     def movement(self):
         """ Called when there is movement detected. """
@@ -131,14 +155,12 @@ class Security(Machine):
 
     def no_movement(self):
         """ Called when the movement stops. """
-        try:
-            self._warning_timer.cancel()
-            self._warning_timer = None
-            print "Stopped warning timer."
-        except AttributeError:
-            # _warning_timer must have been None
-            print "No warning timer to stop."
-            pass
+        was_running = self._warning_timer.is_alive()
+        self._warning_timer.cancel()
+        if was_running:
+            print "Cancelled warning timer."
+        else:
+            print "Warning timer was not running."
 
     def update_mqtt_state(self):
         """ Update mqtt with the current state. """
@@ -148,9 +170,16 @@ class Security(Machine):
             payload=self.state,
             retain=True)
 
+    def _cancel_all_timers(self):
+        """ Cancel all timers. """
+        for timer in (self._warning_timer,
+                      self._sounding_timer,
+                      self._sounding_stop_timer):
+            timer.cancel()
+
     def on_enter_warning(self):
         """ Sound the buzzer and start the sounding timer. """
-        # self._pf.output_pins[SWITCH_PINS["buzzer"]].turn_on()
+        self._buzzer_start()
         self._mqtt.publish(
             "{}{}".format(CHANNEL_PREFIX, "buzzer"),
             payload=PAYLOAD_ON,
@@ -160,21 +189,16 @@ class Security(Machine):
 
     def on_exit_warning(self):
         """ Stop sounding the buzzer. """
-        # self._pf.output_pins[SWITCH_PINS["buzzer"]].turn_off()
+        self._buzzer_stop()
         self._mqtt.publish(
             "{}{}".format(CHANNEL_PREFIX, "buzzer"),
             payload=PAYLOAD_OFF,
             retain=True)
-        try:
-            self._sounding_timer.cancel()
-            self._sounding_timer = None
-        except AttributeError:
-            # _sounding_timer must have been None
-            pass
+        self._cancel_all_timers()
 
     def on_enter_sounding(self):
         """ Sound the siren. """
-        # self._pf.output_pins[SWITCH_PINS["siren"]].turn_on()
+        self._siren_start()
         self._mqtt.publish(
             "{}{}".format(CHANNEL_PREFIX, "siren"),
             payload=PAYLOAD_ON,
@@ -184,17 +208,12 @@ class Security(Machine):
 
     def on_exit_sounding(self):
         """ Stop sounding the siren. """
-        # self._pf.output_pins[SWITCH_PINS["siren"]].turn_off()
+        self._siren_stop()
         self._mqtt.publish(
             "{}{}".format(CHANNEL_PREFIX, "siren"),
             payload=PAYLOAD_OFF,
             retain=True)
-        try:
-            self._sounding_off_timer.cancel()
-            self._sounding_off_timer = None
-        except AttributeError:
-            # _sounding_off_timer must have been None
-            pass
+        self._cancel_all_timers()
 
 
 if __name__ == "__main__":
@@ -214,6 +233,13 @@ if __name__ == "__main__":
     client.connect(args.host, args.port, 60)
     client.loop_start()
 
+    buzzer_start = partial(change_output, SWITCH_PINS["buzzer"], True)
+    buzzer_stop = partial(change_output, SWITCH_PINS["buzzer"], False)
+    siren_start = partial(change_output, SWITCH_PINS["siren"], True)
+    siren_stop = partial(change_output, SWITCH_PINS["siren"], False)
+    security = Security(
+        client, buzzer_start, buzzer_stop, siren_start, siren_stop)
+
     last_states = {inpt: None for _, inpt, _ in INPUTS}
     try:
         while True:
@@ -222,6 +248,11 @@ if __name__ == "__main__":
                 if state != last_states[inpt]:
                     publish_state(chan, state)
                     last_states[inpt] = state
+                    if chan == "motion":
+                        if state:
+                            security.movement()
+                        else:
+                            security.no_movement()
             sleep(0.1)
     except KeyboardInterrupt:
         pass
