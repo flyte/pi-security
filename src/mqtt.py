@@ -30,10 +30,11 @@ PAYLOAD_OFF = "OFF"
 MOVEMENT_TO_WARNING_SECS = 5
 WARNING_TO_SOUNDING_SECS = 20
 SOUNDING_SECS = 120
+RECONNECT_DELAY_SECS = 2
 
 
 def on_connect(client, userdata, flags, rc):
-    print("Connected with result code "+str(rc))
+    print "Connected with result code " + str(rc)
     for chan, _, _ in SWITCHES:
         client.subscribe("{}{}{}".format(CHANNEL_PREFIX, chan, SET_SUFFIX))
     client.subscribe(
@@ -42,6 +43,13 @@ def on_connect(client, userdata, flags, rc):
 
     client.subscribe("{}{}{}".format(CHANNEL_PREFIX, "movement", SET_SUFFIX))
     client.subscribe("{}{}{}".format(CHANNEL_PREFIX, "no_movement", SET_SUFFIX))
+
+
+def on_disconnect(client, userdata, rc):
+    print "Disconnected from MQTT server with code: %s" % rc
+    while rc != 0:
+        sleep(RECONNECT_DELAY_SECS)
+        rc = client.reconnect()
 
 
 def set_all_states():
