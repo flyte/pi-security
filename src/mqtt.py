@@ -31,14 +31,16 @@ MOVEMENT_TO_WARNING_SECS = 5
 WARNING_TO_SOUNDING_SECS = 20
 SOUNDING_SECS = 120
 RECONNECT_DELAY_SECS = 2
+DEFAULT_MQTT_PORT = 1883
 
 
 def on_connect(client, userdata, flags, rc):
     print "Connected with result code " + str(rc)
     for chan, _, _ in SWITCHES:
-        client.subscribe("{}{}{}".format(CHANNEL_PREFIX, chan, SET_SUFFIX))
+        client.subscribe(
+            "{}{}{}".format(CHANNEL_PREFIX, chan, SET_SUFFIX), qos=1)
     client.subscribe(
-        "{}{}{}".format(CHANNEL_PREFIX, SECURITY_CHAN, SET_SUFFIX))
+        "{}{}{}".format(CHANNEL_PREFIX, SECURITY_CHAN, SET_SUFFIX), qos=1)
     set_all_states()
 
     client.subscribe("{}{}{}".format(CHANNEL_PREFIX, "movement", SET_SUFFIX))
@@ -229,12 +231,12 @@ if __name__ == "__main__":
     p.add_argument("user")
     p.add_argument("password")
     p.add_argument("host")
-    p.add_argument("--port", type=int, default=1883)
+    p.add_argument("--port", type=int, default=DEFAULT_MQTT_PORT)
     args = p.parse_args()
 
     pf = pfdio.PiFaceDigital()
 
-    client = mqtt.Client()
+    client = mqtt.Client(client_id="garage-security", clean_session=False)
     client.on_connect = on_connect
     client.on_message = on_msg
     client.username_pw_set(args.user, args.password)
