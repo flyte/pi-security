@@ -5,7 +5,7 @@ from functools import partial
 
 import paho.mqtt.client as mqtt
 import pifacedigitalio as pfdio
-from transitions import Machine
+from transitions import Machine, MachineError
 
 
 CHANNEL_PREFIX = "home/garage/"
@@ -97,10 +97,16 @@ def on_msg(client, userdata, msg):
     if chan == SECURITY_CHAN:
         if msg.payload == "armed":
             print "Arming security..."
-            security.arm()
+            try:
+                security.arm()
+            except MachineError as exc:
+                print "Problem arming alarm: %s" % exc
         elif msg.payload == "disarmed":
             print "Disarming security..."
-            security.disarm()
+            try:
+                security.disarm()
+            except MachineError as exc:
+                print "Problem disarming alarm: %s" % exc
     else:
         try:
             output = SWITCH_PINS[chan]
