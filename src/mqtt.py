@@ -1,8 +1,9 @@
 import argparse
 from time import sleep
-from threading import Timer
+from threading import Timer, Thread
 from functools import partial
 
+import zmq
 import paho.mqtt.client as mqtt
 import pifacedigitalio as pfdio
 from transitions import Machine, MachineError
@@ -32,6 +33,20 @@ WARNING_TO_SOUNDING_SECS = 20
 SOUNDING_SECS = 120
 RECONNECT_DELAY_SECS = 2
 DEFAULT_MQTT_PORT = 1883
+RFID_PREFIX = u"RFID"
+
+
+def change_output(pin, state):
+    if state:
+        pf.output_pins[pin].turn_on()
+    else:
+        pf.output_pins[pin].turn_off()
+
+
+buzzer_start = partial(change_output, SWITCH_PINS["buzzer"], True)
+buzzer_stop = partial(change_output, SWITCH_PINS["buzzer"], False)
+siren_start = partial(change_output, SWITCH_PINS["siren"], True)
+siren_stop = partial(change_output, SWITCH_PINS["siren"], False)
 
 
 def on_connect(client, userdata, flags, rc):
@@ -121,13 +136,6 @@ def on_msg(client, userdata, msg):
     print "{} {}".format(msg.topic, msg.payload)
 
 
-def change_output(pin, state):
-    if state:
-        pf.output_pins[pin].turn_on()
-    else:
-        pf.output_pins[pin].turn_off()
-
-
 class Security(Machine):
     states = "disarmed armed warning sounding".split()
     transitions = [
@@ -193,6 +201,14 @@ class Security(Machine):
                       self._sounding_stop_timer):
             timer.cancel()
 
+    def on_enter_armed(self):
+        """ Sound the buzzer's arm sound. """
+        buzzer_arm()
+
+    def on_enter_disarmed(self):
+        """ Sound the buzzer's disarm sound. """
+        buzzer_disarm()
+
     def on_enter_warning(self):
         """ Sound the buzzer and start the sounding timer. """
         self._buzzer_start()
@@ -232,11 +248,33 @@ class Security(Machine):
         self._cancel_all_timers()
 
 
+def buzzer_arm():
+    def run():
+        for _ in range(3):
+            buzzer_start()
+            sleep(0.5)
+            buzzer_stop()
+            sleep(0.5)
+    Thread(target=run).start()
+
+
+def buzzer_disarm():
+    def run():
+        for _ in range(2):
+            buzzer_start()
+            sleep(0.1)
+            buzzer_stop()
+            sleep(0.25)
+    Thread(target=run).start()
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("user")
     p.add_argument("password")
     p.add_argument("host")
+    p.add_argument("rfid_port", type=int)
+    p.add_argument("allowed_tags")
     p.add_argument("--port", type=int, default=DEFAULT_MQTT_PORT)
     args = p.parse_args()
 
@@ -249,10 +287,14 @@ if __name__ == "__main__":
     client.connect(args.host, args.port, 60)
     client.loop_start()
 
-    buzzer_start = partial(change_output, SWITCH_PINS["buzzer"], True)
-    buzzer_stop = partial(change_output, SWITCH_PINS["buzzer"], False)
-    siren_start = partial(change_output, SWITCH_PINS["siren"], True)
-    siren_stop = partial(change_output, SWITCH_PINS["siren"], False)
+    context = zmq.Context()
+    rfid = context.socket(zmq.SUB)
+    rfid.connect("tcp://localhost:%d" % args.rfid_port)
+    rfid.setsockopt_string(zmq.SUBSCRIBE, RFID_PREFIX)
+    rfid_poller = zmq.Poller()
+    rfid_poller.register(rfid, zmq.POLLIN)
+    allowed_tags = set(args.allowed_tags.split(","))
+
     security = Security(
         client, buzzer_start, buzzer_stop, siren_start, siren_stop)
 
@@ -269,6 +311,13 @@ if __name__ == "__main__":
                             security.movement()
                         else:
                             security.no_movement()
+            if rfid_poller.poll(timeout=0):
+                rfid_tag = rfid.recv_string()[len(RFID_PREFIX):].strip()
+                if rfid_tag in allowed_tags:
+                    if security.is_disarmed():
+                        security.arm()
+                    else:
+                        security.disarm()
             sleep(0.1)
     except KeyboardInterrupt:
         pass
